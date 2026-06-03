@@ -11,9 +11,12 @@ import subprocess
 import sys
 import os
 import argparse
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+__version__ = "1.1.0"
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────
 
@@ -98,6 +101,111 @@ def get_commits(repo_path: str, days: Optional[int] = None,
     return commits
 
 
+def get_file_stats(repo_path: str, days: Optional[int] = None,
+                   author: Optional[str] = None) -> Counter:
+    """
+    Count how many commits touched each file.
+    Uses git log --numstat to find files changed per commit.
+    """
+    cmd = ["log", "--pretty=format:COMMIT:%H", "--numstat", "-n", "5000"]
+    if days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cmd += ["--since", cutoff]
+    if author:
+        cmd += ["--author", author]
+
+    try:
+        raw = run_git(repo_path, *cmd)
+    except SystemExit:
+        return Counter()
+
+    file_counts: Counter = Counter()
+    for line in raw.splitlines():
+        if line.startswith("COMMIT:") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            filepath = parts[2]
+            # Skip binary files and rename targets
+            if filepath.startswith("-") or "=>" in filepath:
+                continue
+            # For renames, take the new path
+            file_counts[filepath] += 1
+
+    return file_counts
+
+
+def get_branch_info(repo_path: str) -> list[dict]:
+    """
+    Get information about local branches:
+    name, last commit date, is current, commit count ahead of main/master.
+    """
+    try:
+        # Get current branch
+        current = run_git(repo_path, "branch", "--show-current").strip()
+
+        # Get all local branches with last commit date
+        sep = "<|BRANCH_SEP|>"
+        raw = run_git(
+            repo_path, "for-each-ref",
+            f"--format=%(refname:short){sep}%(authordate:iso){sep}%(subject)",
+            "refs/heads/"
+        ).strip()
+
+        if not raw:
+            return []
+
+        # Get the default branch (main or master)
+        default_branch = None
+        for candidate in ["main", "master"]:
+            try:
+                run_git(repo_path, "rev-parse", "--verify", candidate)
+                default_branch = candidate
+                break
+            except SystemExit:
+                continue
+
+        branches = []
+        for line in raw.splitlines():
+            parts = line.split(sep, 2)
+            if len(parts) < 3:
+                continue
+            name, date_str, subject = parts
+            try:
+                dt = datetime.fromisoformat(date_str)
+                # Normalize to offset-naive for comparison with now()
+                if dt.tzinfo is not None:
+                    dt = dt.replace(tzinfo=None)
+            except ValueError:
+                continue
+
+            ahead = 0
+            if default_branch and name != default_branch:
+                try:
+                    count_raw = run_git(
+                        repo_path, "rev-list", "--count",
+                        f"{default_branch}..{name}"
+                    ).strip()
+                    ahead = int(count_raw)
+                except (SystemExit, ValueError):
+                    ahead = -1  # diverged or error
+
+            branches.append({
+                "name": name,
+                "date": dt,
+                "subject": subject[:50],
+                "is_current": name == current,
+                "ahead": ahead,
+            })
+
+        # Sort by most recent first
+        branches.sort(key=lambda b: b["date"], reverse=True)
+        return branches[:15]  # Top 15 branches
+
+    except SystemExit:
+        return []
+
+
 # ── analysis ──────────────────────────────────────────────────────────────
 
 def compute_heatmap_data(commits: list[dict]) -> dict:
@@ -164,12 +272,45 @@ def compute_author_stats(commits: list[dict]) -> dict:
     return dict(counts.most_common(10))
 
 
+def compute_commit_verbs(commits: list[dict]) -> list[tuple[str, int]]:
+    """
+    Extract the most common 'verbs' (first word) from commit subjects.
+    Conventional commit prefixes like 'feat:', 'fix:' are extracted.
+    """
+    verb_counts: Counter = Counter()
+
+    # Common conventional commit prefixes to recognize
+    cc_prefixes = re.compile(
+        r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)'
+        r'(?:\([^)]+\))?:',
+        re.IGNORECASE
+    )
+
+    for c in commits:
+        subject = c["subject"].strip()
+        # Check for conventional commit prefix first
+        cc_match = cc_prefixes.match(subject)
+        if cc_match:
+            verb = cc_match.group(1).lower()
+            verb_counts[verb] += 1
+            continue
+
+        # Otherwise, take the first word
+        words = subject.split()
+        if words:
+            verb = words[0].lower().rstrip(":!.,")
+            # Normalize common variants
+            verb = verb.rstrip("ed").rstrip("s") if len(verb) > 4 else verb
+            verb_counts[verb] += 1
+
+    return verb_counts.most_common(12)
+
+
 # ── rendering ─────────────────────────────────────────────────────────────
 
 BAR = "█"
 HALF_BAR = "▌"
 EMPTY = "░"
-
 
 def sparkline(values: list[int]) -> str:
     """Unicode sparkline from a list of ints."""
@@ -184,7 +325,6 @@ def sparkline(values: list[int]) -> str:
         idx = int(v / mx * (len(blocks) - 1))
         parts.append(blocks[idx])
     return "".join(parts)
-
 
 def heatmap_grid(day_counts: dict, weeks: int = 20) -> str:
     """
@@ -243,7 +383,6 @@ def heatmap_grid(day_counts: dict, weeks: int = 20) -> str:
 
     return month_line + "\n" + "\n".join(lines)
 
-
 def bar_chart(label: str, data: dict, max_width: int = 30) -> str:
     """Simple horizontal bar chart."""
     if not data:
@@ -260,12 +399,10 @@ def bar_chart(label: str, data: dict, max_width: int = 30) -> str:
 # ── main output ───────────────────────────────────────────────────────────
 
 def print_report(repo_path: str, days: Optional[int],
-                 author: Optional[str], all_time: bool):
-    commits = get_commits(
-        repo_path,
-        days=None if all_time else (days or 90),
-        author=author,
-    )
+                 author: Optional[str], all_time: bool,
+                 show_files: bool = True, show_branches: bool = True):
+    effective_days = None if all_time else (days or 90)
+    commits = get_commits(repo_path, days=effective_days, author=author)
     if not commits:
         print(f"{Color.YELLOW}No commits found for the given filters.{Color.RESET}")
         return
@@ -278,7 +415,7 @@ def print_report(repo_path: str, days: Optional[int],
     boundary = f"{Color.CYAN}{'─' * 60}{Color.RESET}"
 
     # ── Header ──
-    print(f"\n{Color.BOLD}{Color.PURPLE}  🦖 commit-velociraptor{Color.RESET}")
+    print(f"\n{Color.BOLD}{Color.PURPLE}  🦖 commit-velociraptor{Color.RESET} {Color.DIM}v{__version__}{Color.RESET}")
     print(f"  {Color.DIM}{repo_path}{Color.RESET}")
     print(boundary)
 
@@ -329,6 +466,25 @@ def print_report(repo_path: str, days: Optional[int],
             print(f"  {Color.BOLD}{label}{Color.RESET} {bar} {val}")
         print()
 
+    # ── Commit Verbs / Conventional Commit Breakdown ──
+    commit_verbs = compute_commit_verbs(commits)
+    if commit_verbs:
+        print(f"  {Color.BOLD}📝 Commit Subjects Breakdown{Color.RESET}")
+        print(f"  {Color.DIM}Most common verbs/prefixes in commit messages{Color.RESET}")
+        mx_verb = commit_verbs[0][1] if commit_verbs else 1
+        # Emoji map for conventional commits
+        verb_emoji = {
+            "feat": "✨", "fix": "🐛", "docs": "📖", "style": "💅",
+            "refactor": "♻️", "perf": "⚡", "test": "🧪", "build": "📦",
+            "ci": "⚙️", "chore": "🔧", "revert": "⏪",
+        }
+        for verb, count in commit_verbs:
+            w = int(count / mx_verb * 25)
+            bar = Color.BLUE + BAR * w + Color.RESET + EMPTY * (25 - w)
+            emoji = verb_emoji.get(verb, "📌")
+            print(f"  {emoji} {Color.BOLD}{verb:<12}{Color.RESET} {bar} {Color.CYAN}{count}{Color.RESET}")
+        print()
+
     # ── Top authors ──
     if len(author_stats) > 1:
         print(f"  {Color.BOLD}👥 Top Contributors{Color.RESET}")
@@ -339,6 +495,60 @@ def print_report(repo_path: str, days: Optional[int],
             bar = Color.PURPLE + BAR * w + Color.RESET + EMPTY * (25 - w)
             print(f"  {Color.BOLD}{auth:<22}{Color.RESET} {bar} {cnt} ({pct:.1f}%)")
         print()
+
+    # ── Top Files Changed ──
+    if show_files:
+        print(f"  {Color.BOLD}🏆 Most Changed Files{Color.RESET}")
+        print(f"  {Color.DIM}Files with the most commits touching them{Color.RESET}")
+        file_stats = get_file_stats(repo_path, days=effective_days, author=author)
+        top_files = file_stats.most_common(10)
+        if top_files:
+            mx_file = top_files[0][1]
+            for filepath, count in top_files:
+                w = int(count / mx_file * 25)
+                bar = Color.RED + BAR * w + Color.RESET + EMPTY * (25 - w)
+                # Shorten long paths
+                display_path = filepath
+                if len(filepath) > 40:
+                    parts = filepath.split("/")
+                    if len(parts) > 3:
+                        display_path = "/".join(parts[:2]) + "/…/" + parts[-1]
+                print(f"  {Color.BOLD}{display_path:<42}{Color.RESET} {bar} {Color.CYAN}{count}{Color.RESET}")
+        else:
+            print(f"  {Color.DIM}(no file data available){Color.RESET}")
+        print()
+
+    # ── Branch Overview ──
+    if show_branches:
+        branch_info = get_branch_info(repo_path)
+        if branch_info:
+            print(f"  {Color.BOLD}🔀 Branch Overview{Color.RESET}")
+            print(f"  {Color.DIM}Local branches sorted by recent activity{Color.RESET}")
+            now = datetime.now()
+            for b in branch_info[:10]:
+                age_days = (now - b["date"]).days
+                if age_days == 0:
+                    age_str = "today"
+                elif age_days == 1:
+                    age_str = "yesterday"
+                elif age_days < 30:
+                    age_str = f"{age_days}d ago"
+                elif age_days < 365:
+                    age_str = f"{age_days // 30}mo ago"
+                else:
+                    age_str = f"{age_days // 365}y ago"
+
+                current_marker = f"{Color.GREEN}*{Color.RESET}" if b["is_current"] else " "
+                ahead_str = ""
+                if b["ahead"] > 0:
+                    ahead_str = f" {Color.YELLOW}(+{b['ahead']} ahead){Color.RESET}"
+                elif b["ahead"] == -1:
+                    ahead_str = f" {Color.RED}(diverged){Color.RESET}"
+
+                print(f"  {current_marker} {Color.BOLD}{b['name']:<20}{Color.RESET}"
+                      f" {Color.DIM}{age_str:<10}{Color.RESET}"
+                      f"{ahead_str}")
+            print()
 
     # ── Velocity (last 12 weeks) ──
     print(f"  {Color.BOLD}🚀 Weekly Velocity (recent 12 weeks){Color.RESET}")
@@ -361,7 +571,7 @@ def print_report(repo_path: str, days: Optional[int],
         print(f"  {Color.BOLD}{wk}{Color.RESET}  {bar} {Color.CYAN}{v}{Color.RESET}")
 
     print(f"\n{boundary}")
-    print(f"  {Color.DIM}Generated by commit-velociraptor 🦖{Color.RESET}\n")
+    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__} 🦖{Color.RESET}\n")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -375,7 +585,9 @@ def main():
                "  velociraptor --days 30           # last 30 days\n"
                "  velociraptor --all-time          # all-time stats\n"
                "  velociraptor --author \"John\"      # filter by author\n"
-               "  velociraptor /path/to/repo       # point at another repo\n",
+               "  velociraptor /path/to/repo       # point at another repo\n"
+               "  velociraptor --no-files          # hide file change stats\n"
+               "  velociraptor --no-branches       # hide branch overview\n",
     )
     parser.add_argument("repo", nargs="?", default=".",
                         help="Path to git repo (default: current directory)")
@@ -385,6 +597,12 @@ def main():
                         help="Show all-time stats, ignoring --days")
     parser.add_argument("--author", type=str, default=None,
                         help="Filter by author name (substring match)")
+    parser.add_argument("--no-files", action="store_true",
+                        help="Skip the 'most changed files' section")
+    parser.add_argument("--no-branches", action="store_true",
+                        help="Skip the branch overview section")
+    parser.add_argument("--version", action="version",
+                        version=f"commit-velociraptor v{__version__}")
     args = parser.parse_args()
 
     if not os.path.isdir(args.repo):
@@ -396,7 +614,11 @@ def main():
         print(f"{Color.RED}Error: {args.repo} does not appear to be a git repository.{Color.RESET}", file=sys.stderr)
         sys.exit(1)
 
-    print_report(args.repo, args.days, args.author, args.all_time)
+    print_report(
+        args.repo, args.days, args.author, args.all_time,
+        show_files=not args.no_files,
+        show_branches=not args.no_branches,
+    )
 
 
 if __name__ == "__main__":
