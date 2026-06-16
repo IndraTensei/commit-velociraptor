@@ -12,11 +12,14 @@ import sys
 import os
 import argparse
 import re
+import json
+import csv
+import io
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────
 
@@ -63,7 +66,9 @@ def run_git(repo_path: str, *args) -> str:
 
 
 def get_commits(repo_path: str, days: Optional[int] = None,
-                author: Optional[str] = None) -> list[dict]:
+                author: Optional[str] = None,
+                since: Optional[str] = None,
+                until: Optional[str] = None) -> list[dict]:
     """
     Fetch commit log as a list of dicts with keys:
       hash, author, email, date (datetime), subject
@@ -71,7 +76,11 @@ def get_commits(repo_path: str, days: Optional[int] = None,
     sep = "<|COMMIT_SEP|>"
     fmt_string = f"%H{sep}%an{sep}%ae{sep}%aI{sep}%s"
     cmd = ["log", f"--pretty=format:{fmt_string}", "--date=iso", "-n", "10000"]
-    if days:
+    if since:
+        cmd += ["--since", since]
+    if until:
+        cmd += ["--until", until]
+    if days and not since:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         cmd += ["--since", cutoff]
     if author:
@@ -102,13 +111,19 @@ def get_commits(repo_path: str, days: Optional[int] = None,
 
 
 def get_file_stats(repo_path: str, days: Optional[int] = None,
-                   author: Optional[str] = None) -> Counter:
+                   author: Optional[str] = None,
+                   since: Optional[str] = None,
+                   until: Optional[str] = None) -> Counter:
     """
     Count how many commits touched each file.
     Uses git log --numstat to find files changed per commit.
     """
     cmd = ["log", "--pretty=format:COMMIT:%H", "--numstat", "-n", "5000"]
-    if days:
+    if since:
+        cmd += ["--since", since]
+    if until:
+        cmd += ["--until", until]
+    if days and not since:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
         cmd += ["--since", cutoff]
     if author:
@@ -306,6 +321,188 @@ def compute_commit_verbs(commits: list[dict]) -> list[tuple[str, int]]:
     return verb_counts.most_common(12)
 
 
+# ── export ─────────────────────────────────────────────────────────────────
+
+def export_json(repo_path: str, days: Optional[int],
+                author: Optional[str], all_time: bool,
+                since: Optional[str], until: Optional[str],
+                show_files: bool = True) -> str:
+    """Export all stats as a JSON string."""
+    effective_days = None if all_time else (days or 90)
+    commits = get_commits(repo_path, days=effective_days, author=author,
+                          since=since, until=until)
+    if not commits:
+        return json.dumps({"error": "No commits found for the given filters."})
+
+    day_counts = compute_heatmap_data(commits)
+    cur_streak, long_streak, active_days, ls_start, ls_end = compute_streaks(day_counts)
+    time_stats = compute_time_stats(commits)
+    author_stats = compute_author_stats(commits)
+    verbs = compute_commit_verbs(commits)
+
+    dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    dow_data = {d: time_stats["dow"].get(d, 0) for d in dow_order}
+    hour_data = {f"{h:02d}:00": time_stats["hour"].get(h, 0) for h in range(24)}
+
+    weekly_data: Counter = Counter()
+    for c in commits:
+        dt = c["date"]
+        week_num = dt.isocalendar()[1]
+        year = dt.isocalendar()[0]
+        wk_key = f"{year}-W{week_num:02d}"
+        weekly_data[wk_key] += 1
+    recent_weeks = sorted(weekly_data.keys())[-12:]
+
+    data = {
+        "meta": {
+            "tool": "commit-velociraptor",
+            "version": __version__,
+            "repo": os.path.abspath(repo_path),
+            "generated_at": datetime.now().isoformat(),
+        },
+        "summary": {
+            "total_commits": len(commits),
+            "date_range": {
+                "start": commits[-1]["date"].strftime("%Y-%m-%d"),
+                "end": commits[0]["date"].strftime("%Y-%m-%d"),
+            },
+            "active_days": active_days,
+            "current_streak": cur_streak,
+            "longest_streak": long_streak,
+            "longest_streak_range": {"start": ls_start, "end": ls_end},
+            "avg_commits_per_active_day": round(len(commits) / max(active_days, 1), 1),
+        },
+        "by_day_of_week": dow_data,
+        "by_hour": hour_data,
+        "top_authors": author_stats,
+        "commit_verbs": {verb: count for verb, count in verbs},
+        "weekly_velocity": {wk: weekly_data[wk] for wk in recent_weeks},
+    }
+
+    if show_files:
+        file_stats = get_file_stats(repo_path, days=effective_days, author=author,
+                                    since=since, until=until)
+        data["most_changed_files"] = [
+            {"file": f, "commits": c} for f, c in file_stats.most_common(10)
+        ]
+
+    return json.dumps(data, indent=2)
+
+
+def export_csv(repo_path: str, days: Optional[int],
+               author: Optional[str], all_time: bool,
+               since: Optional[str], until: Optional[str]) -> str:
+    """Export per-commit data as CSV."""
+    effective_days = None if all_time else (days or 90)
+    commits = get_commits(repo_path, days=effective_days, author=author,
+                          since=since, until=until)
+    if not commits:
+        return "hash,author,email,date,subject\n"
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["hash", "author", "email", "date", "subject"])
+    for c in commits:
+        writer.writerow([
+            c["hash"],
+            c["author"],
+            c["email"],
+            c["date"].isoformat(),
+            c["subject"],
+        ])
+    return buf.getvalue()
+
+
+# ── compare ─────────────────────────────────────────────────────────────────
+
+def print_compare(repo_path: str, author1: str, author2: str,
+                  days: Optional[int], all_time: bool,
+                  since: Optional[str], until: Optional[str]):
+    """Compare two authors side-by-side."""
+    effective_days = None if all_time else (days or 90)
+    commits_a1 = get_commits(repo_path, days=effective_days, author=author1,
+                             since=since, until=until)
+    commits_a2 = get_commits(repo_path, days=effective_days, author=author2,
+                             since=since, until=until)
+
+    boundary = f"{Color.CYAN}{'─' * 60}{Color.RESET}"
+    print(f"\n{Color.BOLD}{Color.PURPLE}  🦖 commit-velociraptor — Author Comparison{Color.RESET}")
+    print(f"  {Color.DIM}{repo_path}{Color.RESET}")
+    print(boundary)
+
+    names = [author1, author2]
+    commit_lists = [commits_a1, commits_a2]
+
+    # Summary comparison
+    print(f"\n  {Color.BOLD}📊 Summary Comparison{Color.RESET}")
+    print(f"  {'Metric':<28} {Color.BOLD}{names[0]:<16}{Color.RESET} {Color.BOLD}{names[1]:<16}{Color.RESET}")
+    print(f"  {'─' * 56}")
+
+    def get_stats(commits):
+        if not commits:
+            return (0, 0, 0, 0, 0.0)
+        day_counts = compute_heatmap_data(commits)
+        cur, longest, active, _, _ = compute_streaks(day_counts)
+        avg = len(commits) / max(active, 1)
+        return (len(commits), active, cur, longest, round(avg, 1))
+
+    stats = [get_stats(cl) for cl in commit_lists]
+    labels = ["Commits", "Active days", "Current streak", "Longest streak", "Avg/day"]
+    for i, label in enumerate(labels):
+        v1 = stats[0][i] if len(stats) > 0 else 0
+        v2 = stats[1][i] if len(stats) > 1 else 0
+        if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+            if v1 > v2:
+                c1, c2 = Color.GREEN, Color.DIM
+            elif v2 > v1:
+                c1, c2 = Color.DIM, Color.GREEN
+            else:
+                c1, c2 = Color.CYAN, Color.CYAN
+        else:
+            c1, c2 = "", ""
+        print(f"  {label:<28} {c1}{v1:<16}{Color.RESET} {c2}{v2:<16}{Color.RESET}")
+
+    # Day of week comparison
+    print(f"\n  {Color.BOLD}📆 Day of Week Comparison{Color.RESET}")
+    dow_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    full_dow = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    print(f"  {'Day':<6} {Color.BOLD}{names[0]:<16}{Color.RESET} {Color.BOLD}{names[1]:<16}{Color.RESET}")
+    print(f"  {'─' * 38}")
+    for short, full in zip(dow_order, full_dow):
+        t1 = compute_time_stats(commits_a1)["dow"].get(full, 0) if commits_a1 else 0
+        t2 = compute_time_stats(commits_a2)["dow"].get(full, 0) if commits_a2 else 0
+        mx = max(t1, t2, 1)
+        w1 = int(t1 / mx * 12)
+        w2 = int(t2 / mx * 12)
+        bar1 = Color.GREEN + BAR * w1 + Color.RESET + EMPTY * (12 - w1)
+        bar2 = Color.BLUE + BAR * w2 + Color.RESET + EMPTY * (12 - w2)
+        print(f"  {short:<6} {bar1} {t1:<4} {bar2} {t2}")
+
+    # Commit verbs comparison
+    print(f"\n  {Color.BOLD}📝 Commit Verbs Comparison{Color.RESET}")
+    verbs1 = dict(compute_commit_verbs(commits_a1)) if commits_a1 else {}
+    verbs2 = dict(compute_commit_verbs(commits_a2)) if commits_a2 else {}
+    all_verbs = sorted(set(list(verbs1.keys()) + list(verbs2.keys())))[:8]
+    verb_emoji = {
+        "feat": "✨", "fix": "🐛", "docs": "📖", "style": "💅",
+        "refactor": "♻️", "perf": "⚡", "test": "🧪", "build": "📦",
+        "ci": "⚙️", "chore": "🔧", "revert": "⏪",
+    }
+    for verb in all_verbs:
+        v1 = verbs1.get(verb, 0)
+        v2 = verbs2.get(verb, 0)
+        mx = max(v1, v2, 1)
+        w1 = int(v1 / mx * 12)
+        w2 = int(v2 / mx * 12)
+        bar1 = Color.GREEN + BAR * w1 + Color.RESET + EMPTY * (12 - w1)
+        bar2 = Color.BLUE + BAR * w2 + Color.RESET + EMPTY * (12 - w2)
+        emoji = verb_emoji.get(verb, "📌")
+        print(f"  {emoji} {verb:<10} {bar1} {v1:<4} {bar2} {v2}")
+
+    print(f"\n{boundary}")
+    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__} 🦖{Color.RESET}\n")
+
+
 # ── rendering ─────────────────────────────────────────────────────────────
 
 BAR = "█"
@@ -400,9 +597,11 @@ def bar_chart(label: str, data: dict, max_width: int = 30) -> str:
 
 def print_report(repo_path: str, days: Optional[int],
                  author: Optional[str], all_time: bool,
-                 show_files: bool = True, show_branches: bool = True):
+                 show_files: bool = True, show_branches: bool = True,
+                 since: Optional[str] = None, until: Optional[str] = None):
     effective_days = None if all_time else (days or 90)
-    commits = get_commits(repo_path, days=effective_days, author=author)
+    commits = get_commits(repo_path, days=effective_days, author=author,
+                          since=since, until=until)
     if not commits:
         print(f"{Color.YELLOW}No commits found for the given filters.{Color.RESET}")
         return
@@ -500,7 +699,8 @@ def print_report(repo_path: str, days: Optional[int],
     if show_files:
         print(f"  {Color.BOLD}🏆 Most Changed Files{Color.RESET}")
         print(f"  {Color.DIM}Files with the most commits touching them{Color.RESET}")
-        file_stats = get_file_stats(repo_path, days=effective_days, author=author)
+        file_stats = get_file_stats(repo_path, days=effective_days, author=author,
+                                    since=since, until=until)
         top_files = file_stats.most_common(10)
         if top_files:
             mx_file = top_files[0][1]
@@ -581,13 +781,18 @@ def main():
         description="🦖 commit-velociraptor — Speed through your Git history",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  velociraptor                     # analyze current repo (90 days)\n"
-               "  velociraptor --days 30           # last 30 days\n"
-               "  velociraptor --all-time          # all-time stats\n"
-               "  velociraptor --author \"John\"      # filter by author\n"
-               "  velociraptor /path/to/repo       # point at another repo\n"
-               "  velociraptor --no-files          # hide file change stats\n"
-               "  velociraptor --no-branches       # hide branch overview\n",
+               "  velociraptor                            # analyze current repo (90 days)\n"
+               "  velociraptor --days 30                  # last 30 days\n"
+               "  velociraptor --all-time                 # all-time stats\n"
+               "  velociraptor --author \"John\"             # filter by author\n"
+               "  velociraptor /path/to/repo              # point at another repo\n"
+               "  velociraptor --no-files                 # hide file change stats\n"
+               "  velociraptor --no-branches              # hide branch overview\n"
+               "  velociraptor --since 2025-01-01        # commits after date\n"
+               "  velociraptor --until 2025-06-01        # commits before date\n"
+               "  velociraptor --export json              # export stats as JSON\n"
+               "  velociraptor --export csv               # export commits as CSV\n"
+               "  velociraptor --compare \"Alice\" \"Bob\"   # compare two authors\n",
     )
     parser.add_argument("repo", nargs="?", default=".",
                         help="Path to git repo (default: current directory)")
@@ -597,6 +802,15 @@ def main():
                         help="Show all-time stats, ignoring --days")
     parser.add_argument("--author", type=str, default=None,
                         help="Filter by author name (substring match)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Show commits after this date (YYYY-MM-DD or git date format)")
+    parser.add_argument("--until", type=str, default=None,
+                        help="Show commits before this date (YYYY-MM-DD or git date format)")
+    parser.add_argument("--export", type=str, choices=["json", "csv"], default=None,
+                        help="Export data as JSON (full stats) or CSV (per-commit)")
+    parser.add_argument("--compare", type=str, nargs=2, default=None,
+                        metavar=("AUTHOR1", "AUTHOR2"),
+                        help="Compare two authors side-by-side")
     parser.add_argument("--no-files", action="store_true",
                         help="Skip the 'most changed files' section")
     parser.add_argument("--no-branches", action="store_true",
@@ -614,10 +828,38 @@ def main():
         print(f"{Color.RED}Error: {args.repo} does not appear to be a git repository.{Color.RESET}", file=sys.stderr)
         sys.exit(1)
 
+    # Handle --export
+    if args.export == "json":
+        output = export_json(
+            args.repo, args.days, args.author, args.all_time,
+            since=args.since, until=args.until,
+        )
+        print(output)
+        return
+
+    if args.export == "csv":
+        output = export_csv(
+            args.repo, args.days, args.author, args.all_time,
+            since=args.since, until=args.until,
+        )
+        print(output)
+        return
+
+    # Handle --compare
+    if args.compare:
+        print_compare(
+            args.repo, args.compare[0], args.compare[1],
+            args.days, args.all_time,
+            since=args.since, until=args.until,
+        )
+        return
+
+    # Default: print the full report
     print_report(
         args.repo, args.days, args.author, args.all_time,
         show_files=not args.no_files,
         show_branches=not args.no_branches,
+        since=args.since, until=args.until,
     )
 
 
