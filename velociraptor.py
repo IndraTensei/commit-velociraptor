@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-commit-velociraptor 🦖 — Speed through your Git history.
+commit-velociraptor — Speed through your Git history.
 
 Analyzes commit velocity, streaks, patterns per day-of-week & hour-of-day,
 and renders a beautiful terminal heatmap. Think "GitHub contribution graph"
@@ -19,7 +19,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ── ANSI helpers ──────────────────────────────────────────────────────────
 
@@ -269,13 +269,16 @@ def compute_streaks(day_counts: dict) -> tuple[int, int, int, str, str]:
     return current_streak, longest, len(day_counts), longest_start, longest_end
 
 
-def compute_time_stats(commits: list[dict]) -> dict:
-    """Stats broken down by day-of-week, hour-of-week."""
+def compute_time_stats(commits: list[dict], use_local: bool = False) -> dict:
+    """Stats broken down by day-of-week, hour-of-day."""
     dow_counts = Counter()
     hour_counts = Counter()
     for c in commits:
-        dow_counts[c["date"].strftime("%A")] += 1
-        hour_counts[c["date"].hour] += 1
+        dt = c["date"]
+        if use_local and dt.tzinfo is not None:
+            dt = dt.astimezone()
+        dow_counts[dt.strftime("%A")] += 1
+        hour_counts[dt.hour] += 1
     return {"dow": dict(dow_counts), "hour": dict(hour_counts)}
 
 
@@ -321,6 +324,185 @@ def compute_commit_verbs(commits: list[dict]) -> list[tuple[str, int]]:
     return verb_counts.most_common(12)
 
 
+def compute_quality_score(commits: list[dict]) -> dict:
+    """
+    Analyze commit message quality and return a score breakdown.
+
+    Scoring criteria:
+    - Conventional commit prefix: +30 points (% of commits using conventional format)
+    - Descriptive length (10-72 chars): +25 points
+    - No generic messages (e.g. "update", "fix"): +20 points
+    - Imperative mood detection: +15 points
+    - Contains issue/ticket reference: +10 points
+    """
+    if not commits:
+        return {"overall": 0, "details": {}}
+
+    total = len(commits)
+
+    # Conventional commit adherence
+    cc_pattern = re.compile(
+        r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)'
+        r'(?:\([^)]+\))?:',
+        re.IGNORECASE
+    )
+    cc_count = sum(1 for c in commits if cc_pattern.match(c["subject"].strip()))
+    cc_pct = cc_count / total
+    cc_score = round(cc_pct * 30, 1)
+
+    # Descriptive length (10-72 chars is the sweet spot)
+    good_length_count = sum(
+        1 for c in commits
+        if 10 <= len(c["subject"]) <= 72
+    )
+    length_pct = good_length_count / total
+    length_score = round(length_pct * 25, 1)
+
+    # No generic/vague messages
+    generic_patterns = re.compile(
+        r'^(update|fix|changed|changes|wip|temp|test|stuff|misc|'
+        r'asdf|foo|bar|lol|oops|oopsie|tmp|draft|save|checkpoint)$',
+        re.IGNORECASE
+    )
+    non_generic = sum(
+        1 for c in commits
+        if not generic_patterns.match(c["subject"].strip())
+    )
+    non_generic_pct = non_generic / total
+    non_generic_score = round(non_generic_pct * 20, 1)
+
+    # Imperative mood (starts with a verb-like word, not past tense)
+    imperative_starters = re.compile(
+        r'^(add|remove|create|delete|implement|refactor|fix|update|'
+        r'improve|optimize|rename|move|merge|bump|release|document|'
+        r'simplify|extract|replace|enable|disable|support|allow|prevent|'
+        r'feat|chore|style|test|build|ci|perf|revert|docs)',
+        re.IGNORECASE
+    )
+    imperative_count = sum(
+        1 for c in commits
+        if imperative_starters.match(c["subject"].strip())
+    )
+    imperative_pct = imperative_count / total
+    imperative_score = round(imperative_pct * 15, 1)
+
+    # Issue/ticket reference
+    issue_pattern = re.compile(r'#(\d+)|([A-Z][A-Z]+-\d+)')
+    issue_count = sum(
+        1 for c in commits
+        if issue_pattern.search(c["subject"])
+    )
+    issue_pct = issue_count / total
+    issue_score = round(issue_pct * 10, 1)
+
+    overall = round(cc_score + length_score + non_generic_score + imperative_score + issue_score, 1)
+
+    return {
+        "overall": overall,
+        "grade": _score_to_grade(overall),
+        "details": {
+            "conventional_commits": {
+                "score": cc_score,
+                "max": 30,
+                "pct": round(cc_pct * 100, 1),
+                "count": cc_count,
+            },
+            "message_length": {
+                "score": length_score,
+                "max": 25,
+                "pct": round(length_pct * 100, 1),
+                "count": good_length_count,
+            },
+            "no_generic_messages": {
+                "score": non_generic_score,
+                "max": 20,
+                "pct": round(non_generic_pct * 100, 1),
+                "count": non_generic,
+            },
+            "imperative_mood": {
+                "score": imperative_score,
+                "max": 15,
+                "pct": round(imperative_pct * 100, 1),
+                "count": imperative_count,
+            },
+            "issue_references": {
+                "score": issue_score,
+                "max": 10,
+                "pct": round(issue_pct * 100, 1),
+                "count": issue_count,
+            },
+        },
+    }
+
+
+def _score_to_grade(score: float) -> str:
+    """Convert a 0-100 score to a letter grade."""
+    if score >= 90:
+        return "A+"
+    elif score >= 80:
+        return "A"
+    elif score >= 70:
+        return "B"
+    elif score >= 60:
+        return "C"
+    elif score >= 50:
+        return "D"
+    else:
+        return "F"
+
+
+def compute_velocity_trend(commits: list[dict]) -> dict:
+    """
+    Compare the first half vs second half of the commit period
+    to determine if velocity is trending up or down.
+    """
+    if not commits or len(commits) < 4:
+        return {"trend": "insufficient_data", "change_pct": 0, "direction": "→"}
+
+    # Sort commits by date
+    sorted_commits = sorted(commits, key=lambda c: c["date"])
+    mid = len(sorted_commits) // 2
+
+    first_half = sorted_commits[:mid]
+    second_half = sorted_commits[mid:]
+
+    # Calculate the date span of each half
+    def date_range_days(clist):
+        if len(clist) < 2:
+            return 1
+        delta = clist[-1]["date"] - clist[0]["date"]
+        return max(delta.days, 1)
+
+    first_days = date_range_days(first_half)
+    second_days = date_range_days(second_half)
+
+    first_rate = len(first_half) / first_days
+    second_rate = len(second_half) / second_days
+
+    if first_rate == 0:
+        change_pct = 100.0 if second_rate > 0 else 0.0
+    else:
+        change_pct = round((second_rate - first_rate) / first_rate * 100, 1)
+
+    if change_pct > 10:
+        trend = "accelerating"
+        direction = "↑"
+    elif change_pct < -10:
+        trend = "decelerating"
+        direction = "↓"
+    else:
+        trend = "stable"
+        direction = "→"
+
+    return {
+        "trend": trend,
+        "change_pct": change_pct,
+        "direction": direction,
+        "first_half_rate": round(first_rate, 2),
+        "second_half_rate": round(second_rate, 2),
+    }
+
+
 # ── export ─────────────────────────────────────────────────────────────────
 
 def export_json(repo_path: str, days: Optional[int],
@@ -339,6 +521,8 @@ def export_json(repo_path: str, days: Optional[int],
     time_stats = compute_time_stats(commits)
     author_stats = compute_author_stats(commits)
     verbs = compute_commit_verbs(commits)
+    quality = compute_quality_score(commits)
+    trend = compute_velocity_trend(commits)
 
     dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     dow_data = {d: time_stats["dow"].get(d, 0) for d in dow_order}
@@ -377,6 +561,8 @@ def export_json(repo_path: str, days: Optional[int],
         "top_authors": author_stats,
         "commit_verbs": {verb: count for verb, count in verbs},
         "weekly_velocity": {wk: weekly_data[wk] for wk in recent_weeks},
+        "quality_score": quality,
+        "velocity_trend": trend,
     }
 
     if show_files:
@@ -426,7 +612,7 @@ def print_compare(repo_path: str, author1: str, author2: str,
                              since=since, until=until)
 
     boundary = f"{Color.CYAN}{'─' * 60}{Color.RESET}"
-    print(f"\n{Color.BOLD}{Color.PURPLE}  🦖 commit-velociraptor — Author Comparison{Color.RESET}")
+    print(f"\n{Color.BOLD}{Color.PURPLE}  commit-velociraptor — Author Comparison{Color.RESET}")
     print(f"  {Color.DIM}{repo_path}{Color.RESET}")
     print(boundary)
 
@@ -434,7 +620,7 @@ def print_compare(repo_path: str, author1: str, author2: str,
     commit_lists = [commits_a1, commits_a2]
 
     # Summary comparison
-    print(f"\n  {Color.BOLD}📊 Summary Comparison{Color.RESET}")
+    print(f"\n  {Color.BOLD}Summary Comparison{Color.RESET}")
     print(f"  {'Metric':<28} {Color.BOLD}{names[0]:<16}{Color.RESET} {Color.BOLD}{names[1]:<16}{Color.RESET}")
     print(f"  {'─' * 56}")
 
@@ -463,7 +649,7 @@ def print_compare(repo_path: str, author1: str, author2: str,
         print(f"  {label:<28} {c1}{v1:<16}{Color.RESET} {c2}{v2:<16}{Color.RESET}")
 
     # Day of week comparison
-    print(f"\n  {Color.BOLD}📆 Day of Week Comparison{Color.RESET}")
+    print(f"\n  {Color.BOLD}Day of Week Comparison{Color.RESET}")
     dow_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     full_dow = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     print(f"  {'Day':<6} {Color.BOLD}{names[0]:<16}{Color.RESET} {Color.BOLD}{names[1]:<16}{Color.RESET}")
@@ -479,14 +665,14 @@ def print_compare(repo_path: str, author1: str, author2: str,
         print(f"  {short:<6} {bar1} {t1:<4} {bar2} {t2}")
 
     # Commit verbs comparison
-    print(f"\n  {Color.BOLD}📝 Commit Verbs Comparison{Color.RESET}")
+    print(f"\n  {Color.BOLD}Commit Verbs Comparison{Color.RESET}")
     verbs1 = dict(compute_commit_verbs(commits_a1)) if commits_a1 else {}
     verbs2 = dict(compute_commit_verbs(commits_a2)) if commits_a2 else {}
     all_verbs = sorted(set(list(verbs1.keys()) + list(verbs2.keys())))[:8]
     verb_emoji = {
-        "feat": "✨", "fix": "🐛", "docs": "📖", "style": "💅",
-        "refactor": "♻️", "perf": "⚡", "test": "🧪", "build": "📦",
-        "ci": "⚙️", "chore": "🔧", "revert": "⏪",
+        "feat": "feat", "fix": "fix", "docs": "docs", "style": "style",
+        "refactor": "re", "perf": "perf", "test": "test", "build": "build",
+        "ci": "ci", "chore": "chore", "revert": "rev",
     }
     for verb in all_verbs:
         v1 = verbs1.get(verb, 0)
@@ -496,11 +682,10 @@ def print_compare(repo_path: str, author1: str, author2: str,
         w2 = int(v2 / mx * 12)
         bar1 = Color.GREEN + BAR * w1 + Color.RESET + EMPTY * (12 - w1)
         bar2 = Color.BLUE + BAR * w2 + Color.RESET + EMPTY * (12 - w2)
-        emoji = verb_emoji.get(verb, "📌")
-        print(f"  {emoji} {verb:<10} {bar1} {v1:<4} {bar2} {v2}")
+        print(f"  {verb:<10} {bar1} {v1:<4} {bar2} {v2}")
 
     print(f"\n{boundary}")
-    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__} 🦖{Color.RESET}\n")
+    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__}{Color.RESET}\n")
 
 
 # ── rendering ─────────────────────────────────────────────────────────────
@@ -598,7 +783,8 @@ def bar_chart(label: str, data: dict, max_width: int = 30) -> str:
 def print_report(repo_path: str, days: Optional[int],
                  author: Optional[str], all_time: bool,
                  show_files: bool = True, show_branches: bool = True,
-                 since: Optional[str] = None, until: Optional[str] = None):
+                 since: Optional[str] = None, until: Optional[str] = None,
+                 use_local_time: bool = False):
     effective_days = None if all_time else (days or 90)
     commits = get_commits(repo_path, days=effective_days, author=author,
                           since=since, until=until)
@@ -608,36 +794,48 @@ def print_report(repo_path: str, days: Optional[int],
 
     day_counts = compute_heatmap_data(commits)
     cur_streak, long_streak, active_days, ls_start, ls_end = compute_streaks(day_counts)
-    time_stats = compute_time_stats(commits)
+    time_stats = compute_time_stats(commits, use_local=use_local_time)
     author_stats = compute_author_stats(commits)
 
     boundary = f"{Color.CYAN}{'─' * 60}{Color.RESET}"
 
     # ── Header ──
-    print(f"\n{Color.BOLD}{Color.PURPLE}  🦖 commit-velociraptor{Color.RESET} {Color.DIM}v{__version__}{Color.RESET}")
+    print(f"\n{Color.BOLD}{Color.PURPLE}  commit-velociraptor{Color.RESET} {Color.DIM}v{__version__}{Color.RESET}")
     print(f"  {Color.DIM}{repo_path}{Color.RESET}")
     print(boundary)
 
     # ── Summary ──
-    date_range = f"{commits[-1]['date'].strftime('%Y-%m-%d')} → {commits[0]['date'].strftime('%Y-%m-%d')}"
-    print(f"\n  {Color.BOLD}📊 Summary{Color.RESET}")
+    date_range = f"{commits[-1]['date'].strftime('%Y-%m-%d')} -> {commits[0]['date'].strftime('%Y-%m-%d')}"
+    print(f"\n  {Color.BOLD}Summary{Color.RESET}")
     print(f"     Total commits:       {Color.CYAN}{len(commits)}{Color.RESET}")
     print(f"     Date range:          {date_range}")
     print(f"     Active days:         {Color.CYAN}{active_days}{Color.RESET}")
     print(f"     Current streak:      {Color.GREEN}{cur_streak} days{Color.RESET}")
     print(f"     Longest streak:      {Color.YELLOW}{long_streak} days{Color.RESET}"
-          f"{'  (' + ls_start + ' → ' + ls_end + ')' if long_streak > 1 else ''}")
+          f"{'  (' + ls_start + ' -> ' + ls_end + ')' if long_streak > 1 else ''}")
     daily = len(commits) / max(active_days, 1)
     print(f"     Avg commits/active:  {Color.CYAN}{daily:.1f}{Color.RESET}")
 
+    # ── Velocity Trend ──
+    trend = compute_velocity_trend(commits)
+    if trend["trend"] != "insufficient_data":
+        trend_color = Color.GREEN if trend["trend"] == "accelerating" else (
+            Color.RED if trend["trend"] == "decelerating" else Color.YELLOW
+        )
+        print(f"\n  {Color.BOLD}Velocity Trend{Color.RESET}")
+        print(f"     Direction:     {trend_color}{trend['direction']} {trend['trend']}{Color.RESET}")
+        print(f"     Change:        {trend_color}{trend['change_pct']:+.1f}%{Color.RESET}")
+        print(f"     First half:    {trend['first_half_rate']} commits/day")
+        print(f"     Second half:   {trend['second_half_rate']} commits/day")
+
     # ── Heatmap ──
-    print(f"\n  {Color.BOLD}📅 Commit Calendar{Color.RESET}")
+    print(f"\n  {Color.BOLD}Commit Calendar{Color.RESET}")
     grid = heatmap_grid(day_counts)
     for line in grid.split("\n"):
         print(f"  {line}")
 
     # ── Day-of-week ──
-    print(f"\n  {Color.BOLD}📆 Activity by Day of Week{Color.RESET}")
+    print(f"\n  {Color.BOLD}Activity by Day of Week{Color.RESET}")
     dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     dow_data = {d: time_stats["dow"].get(d, 0) for d in dow_order}
     print(bar_chart("DoW", dow_data))
@@ -647,12 +845,13 @@ def print_report(repo_path: str, days: Optional[int],
         sorted_days = sorted(day_counts.keys())
         values = [day_counts[d] for d in sorted_days]
         spark = sparkline(values)
-        print(f"\n  {Color.BOLD}🔥 Activity Sparkline{Color.RESET}")
+        print(f"\n  {Color.BOLD}Activity Sparkline{Color.RESET}")
         print(f"  {Color.CYAN}{spark}{Color.RESET}")
         print(f"  {Color.DIM}{sorted_days[0]}                        {sorted_days[-1]}{Color.RESET}")
 
     # ── Hour-of-day ──
-    print(f"\n  {Color.BOLD}🕐 Commits by Hour of Day (UTC){Color.RESET}")
+    tz_label = "Local" if use_local_time else "UTC"
+    print(f"\n  {Color.BOLD}Commits by Hour of Day ({tz_label}){Color.RESET}")
     hour_data = {f"{h:02d}:00": time_stats["hour"].get(h, 0) for h in range(24)}
     hour_items = list(hour_data.items())
     # Show in 4 columns of 6 hours each
@@ -668,25 +867,36 @@ def print_report(repo_path: str, days: Optional[int],
     # ── Commit Verbs / Conventional Commit Breakdown ──
     commit_verbs = compute_commit_verbs(commits)
     if commit_verbs:
-        print(f"  {Color.BOLD}📝 Commit Subjects Breakdown{Color.RESET}")
+        print(f"  {Color.BOLD}Commit Subjects Breakdown{Color.RESET}")
         print(f"  {Color.DIM}Most common verbs/prefixes in commit messages{Color.RESET}")
         mx_verb = commit_verbs[0][1] if commit_verbs else 1
-        # Emoji map for conventional commits
-        verb_emoji = {
-            "feat": "✨", "fix": "🐛", "docs": "📖", "style": "💅",
-            "refactor": "♻️", "perf": "⚡", "test": "🧪", "build": "📦",
-            "ci": "⚙️", "chore": "🔧", "revert": "⏪",
-        }
         for verb, count in commit_verbs:
             w = int(count / mx_verb * 25)
             bar = Color.BLUE + BAR * w + Color.RESET + EMPTY * (25 - w)
-            emoji = verb_emoji.get(verb, "📌")
-            print(f"  {emoji} {Color.BOLD}{verb:<12}{Color.RESET} {bar} {Color.CYAN}{count}{Color.RESET}")
+            print(f"  {Color.BOLD}{verb:<12}{Color.RESET} {bar} {Color.CYAN}{count}{Color.RESET}")
+        print()
+
+    # ── Commit Quality Score ──
+    quality = compute_quality_score(commits)
+    if commits:
+        grade_color = Color.GREEN if quality["overall"] >= 70 else (
+            Color.YELLOW if quality["overall"] >= 50 else Color.RED
+        )
+        print(f"  {Color.BOLD}Commit Message Quality{Color.RESET}")
+        print(f"  {Color.DIM}Score: 0-100 with breakdown{Color.RESET}")
+        print(f"     Overall: {grade_color}{quality['overall']}/100 ({quality['grade']}){Color.RESET}")
+        print()
+        # Show each sub-score as a mini bar
+        for criterion, info in quality["details"].items():
+            w = int(info["score"] / info["max"] * 20)
+            bar = Color.CYAN + BAR * w + Color.RESET + EMPTY * (20 - w)
+            label = criterion.replace("_", " ").title()
+            print(f"     {label:<24} {bar} {info['score']}/{info['max']}")
         print()
 
     # ── Top authors ──
     if len(author_stats) > 1:
-        print(f"  {Color.BOLD}👥 Top Contributors{Color.RESET}")
+        print(f"  {Color.BOLD}Top Contributors{Color.RESET}")
         total = sum(author_stats.values())
         for auth, cnt in author_stats.items():
             pct = cnt / total * 100
@@ -697,7 +907,7 @@ def print_report(repo_path: str, days: Optional[int],
 
     # ── Top Files Changed ──
     if show_files:
-        print(f"  {Color.BOLD}🏆 Most Changed Files{Color.RESET}")
+        print(f"  {Color.BOLD}Most Changed Files{Color.RESET}")
         print(f"  {Color.DIM}Files with the most commits touching them{Color.RESET}")
         file_stats = get_file_stats(repo_path, days=effective_days, author=author,
                                     since=since, until=until)
@@ -712,7 +922,7 @@ def print_report(repo_path: str, days: Optional[int],
                 if len(filepath) > 40:
                     parts = filepath.split("/")
                     if len(parts) > 3:
-                        display_path = "/".join(parts[:2]) + "/…/" + parts[-1]
+                        display_path = "/".join(parts[:2]) + "/.../" + parts[-1]
                 print(f"  {Color.BOLD}{display_path:<42}{Color.RESET} {bar} {Color.CYAN}{count}{Color.RESET}")
         else:
             print(f"  {Color.DIM}(no file data available){Color.RESET}")
@@ -722,7 +932,7 @@ def print_report(repo_path: str, days: Optional[int],
     if show_branches:
         branch_info = get_branch_info(repo_path)
         if branch_info:
-            print(f"  {Color.BOLD}🔀 Branch Overview{Color.RESET}")
+            print(f"  {Color.BOLD}Branch Overview{Color.RESET}")
             print(f"  {Color.DIM}Local branches sorted by recent activity{Color.RESET}")
             now = datetime.now()
             for b in branch_info[:10]:
@@ -751,7 +961,7 @@ def print_report(repo_path: str, days: Optional[int],
             print()
 
     # ── Velocity (last 12 weeks) ──
-    print(f"  {Color.BOLD}🚀 Weekly Velocity (recent 12 weeks){Color.RESET}")
+    print(f"  {Color.BOLD}Weekly Velocity (recent 12 weeks){Color.RESET}")
     now = datetime.now()
     weekly_data: Counter = Counter()
     for c in commits:
@@ -771,14 +981,14 @@ def print_report(repo_path: str, days: Optional[int],
         print(f"  {Color.BOLD}{wk}{Color.RESET}  {bar} {Color.CYAN}{v}{Color.RESET}")
 
     print(f"\n{boundary}")
-    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__} 🦖{Color.RESET}\n")
+    print(f"  {Color.DIM}Generated by commit-velociraptor v{__version__}{Color.RESET}\n")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="🦖 commit-velociraptor — Speed through your Git history",
+        description="commit-velociraptor — Speed through your Git history",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  velociraptor                            # analyze current repo (90 days)\n"
@@ -792,7 +1002,8 @@ def main():
                "  velociraptor --until 2025-06-01        # commits before date\n"
                "  velociraptor --export json              # export stats as JSON\n"
                "  velociraptor --export csv               # export commits as CSV\n"
-               "  velociraptor --compare \"Alice\" \"Bob\"   # compare two authors\n",
+               "  velociraptor --compare \"Alice\" \"Bob\"   # compare two authors\n"
+               "  velociraptor --local-time               # use local timezone for hours\n",
     )
     parser.add_argument("repo", nargs="?", default=".",
                         help="Path to git repo (default: current directory)")
@@ -815,6 +1026,8 @@ def main():
                         help="Skip the 'most changed files' section")
     parser.add_argument("--no-branches", action="store_true",
                         help="Skip the branch overview section")
+    parser.add_argument("--local-time", action="store_true",
+                        help="Display hour-of-day stats in local timezone instead of UTC")
     parser.add_argument("--version", action="version",
                         version=f"commit-velociraptor v{__version__}")
     args = parser.parse_args()
@@ -860,6 +1073,7 @@ def main():
         show_files=not args.no_files,
         show_branches=not args.no_branches,
         since=args.since, until=args.until,
+        use_local_time=args.local_time,
     )
 
 

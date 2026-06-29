@@ -1,4 +1,4 @@
-# 🦖 commit-velociraptor
+# commit-velociraptor
 
 > **Speed through your Git history.**
 
@@ -9,34 +9,37 @@ your terminal, for *any* local repo, no browser needed.
 ![terminal demo](https://img.shields.io/badge/platform-terminal-brightgreen)
 ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
-![version](https://img.shields.io/badge/version-1.2.0-orange)
+![version](https://img.shields.io/badge/version-1.3.0-orange)
 
 ---
 
-## ✨ Features
+## Features
 
-- 📅 **Commit Calendar** — GitHub-style heatmap grid rendered with ANSI colors
-- 🔥 **Activity Sparkline** — At-a-glance trend line across your history
-- 📊 **Day-of-Week Analysis** — Know your most and least productive days
-- 🕐 **Hour-of-Day Breakdown** — Find your peak coding hours
-- 🏟️ **Streak Tracking** — Current streak vs. longest ever, with dates
-- 👥 **Contributor Stats** — Who's pushing the most in this repo?
-- 🚀 **Weekly Velocity** — Last 12 weeks of commit volume, bar chart style
-- 🏷️ **Author Filtering** — Zoom in on one contributor
-- 📝 **Commit Subjects Breakdown** — Most common verbs & conventional commit prefixes (feat, fix, docs…) with emoji indicators
-- 🏆 **Most Changed Files** — Find the hotspots — which files get committed most often
-- 🔀 **Branch Overview** — See all local branches sorted by recency, with ahead/behind status vs main
-- 📏 **Configurable Windows** — 30 days, 90 days, or all-time
-- 🏳️ **Version Flag** — `--version` to check which version you're running
-- 📤 **Export as JSON/CSV** — Machine-readable output for CI/CD, dashboards, or external analysis (`--export json|csv`)
-- 📆 **Flexible Date Filters** — `--since` and `--until` for precise date ranges (accepts `YYYY-MM-DD` or any git date format)
-- 🆚 **Author Comparison** — `--compare "Alice" "Bob"` shows side-by-side stats for two contributors
+- **Commit Calendar** — GitHub-style heatmap grid rendered with ANSI colors
+- **Activity Sparkline** — At-a-glance trend line across your history
+- **Day-of-Week Analysis** — Know your most and least productive days
+- **Hour-of-Day Breakdown** — Find your peak coding hours (UTC or local time)
+- **Streak Tracking** — Current streak vs. longest ever, with dates
+- **Contributor Stats** — Who's pushing the most in this repo?
+- **Weekly Velocity** — Last 12 weeks of commit volume, bar chart style
+- **Author Filtering** — Zoom in on one contributor
+- **Commit Subjects Breakdown** — Most common verbs & conventional commit prefixes (feat, fix, docs...)
+- **Commit Message Quality Score** — 0-100 score with breakdown: conventional commit adherence, message length, generic message detection, imperative mood, and issue references
+- **Velocity Trend Indicator** — Shows whether commit pace is accelerating, decelerating, or stable compared to the previous period
+- **Most Changed Files** — Find the hotspots — which files get committed most often
+- **Branch Overview** — See all local branches sorted by recency, with ahead/behind status vs main
+- **Configurable Windows** — 30 days, 90 days, or all-time
+- **Version Flag** — `--version` to check which version you're running
+- **Export as JSON/CSV** — Machine-readable output for CI/CD, dashboards, or external analysis (`--export json|csv`)
+- **Flexible Date Filters** — `--since` and `--until` for precise date ranges (accepts `YYYY-MM-DD` or any git date format)
+- **Author Comparison** — `--compare "Alice" "Bob"` shows side-by-side stats for two contributors
+- **Local Timezone** — `--local-time` to display hour-of-day stats in your local timezone instead of UTC
 
 No dependencies, no browser, no API keys. Just Python 3.8+ and `git`.
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ### Quick run (no install)
 
@@ -58,12 +61,12 @@ ln -s "$(pwd)/velociraptor.py" ~/.local/bin/velociraptor
 ### Requirements
 
 - Python 3.8 or newer
-- A git repository (obviously 😄)
+- A git repository
 - A terminal that supports ANSI color codes (basically any modern terminal)
 
 ---
 
-## 📖 Usage
+## Usage
 
 ```bash
 # Analyze the repo you're currently in (last 90 days)
@@ -103,6 +106,9 @@ velociraptor --compare "Alice" "Bob"
 velociraptor --no-files
 velociraptor --no-branches
 
+# Use local timezone for hour-of-day display
+velociraptor --local-time
+
 # Check your version
 velociraptor --version
 
@@ -112,22 +118,28 @@ velociraptor ~/code/some-repo --days 365 --author "Bob" --export json
 
 ---
 
-## 🖼️ Example Output
+## Example Output
 
 ```
-  🦖 commit-velociraptor v1.2.0
+  commit-velociraptor v1.3.0
   /home/indra/projects/velociraptor
   ────────────────────────────────────────────────────────────
 
-  📊 Summary
+  Summary
      Total commits:       847
-     Date range:          2025-03-01 → 2026-05-30
+     Date range:          2025-03-01 -> 2026-05-30
      Active days:         203
      Current streak:      14 days
-     Longest streak:      31 days  (2026-01-02 → 2026-02-01)
+     Longest streak:      31 days  (2026-01-02 -> 2026-02-01)
      Avg commits/active:  4.2
 
-  📅 Commit Calendar
+  Velocity Trend
+     Direction:     ↑ accelerating
+     Change:        +23.5%
+     First half:    3.2 commits/day
+     Second half:   4.0 commits/day
+
+  Commit Calendar
      O M J J A S O N
   Sun
   Mon ░░░░██░░██░░██░░░░██░░██░░██░░░░██░░██░░██░░░░██░░██░░░░
@@ -137,52 +149,62 @@ velociraptor ~/code/some-repo --days 365 --author "Bob" --export json
   Fri ...
   Sat ...
 
-  📆 Activity by Day of Week
+  Activity by Day of Week
   Wednesday  ██████████████████████████████ 142
   Tuesday    ████████████████████████████   131
   Monday     █████████████████████████       124
   ...
 
-  🕐 Commits by Hour of Day (UTC)
+  Commits by Hour of Day (Local)
   01:00  ████████████████████ 42
   10:00  █████████░░░░░░░░░░░ 18
   14:00  ██████████████████████████ 51
   ...
 
-  📝 Commit Subjects Breakdown
+  Commit Subjects Breakdown
   Most common verbs/prefixes in commit messages
-  ✨ feat         █████████████████████████ 193
-  🐛 fix          ██████████████████░░░░░░░ 121
-  ♻️ refactor      █████████████░░░░░░░░░░░░ 84
-  📖 docs         █████░░░░░░░░░░░░░░░░░░░░ 31
+  feat         █████████████████████████ 193
+  fix          ██████████████████░░░░░░░ 121
+  refactor     █████████████░░░░░░░░░░░░ 84
+  docs         █████░░░░░░░░░░░░░░░░░░░░ 31
   ...
 
-  🏆 Most Changed Files
+  Commit Message Quality
+  Score: 0-100 with breakdown
+     Overall: 78.5/100 (B)
+
+     Conventional Commits       ██████████████████░░ 24.0/30
+     Message Length             █████████████████░░░ 20.0/25
+     No Generic Messages        ████████████████░░░░ 16.0/20
+     Imperative Mood            ████████████░░░░░░░░ 9.0/15
+     Issue References           █████████░░░░░░░░░░░ 9.5/10
+
+  Most Changed Files
   Files with the most commits touching them
   src/core/engine.py                         █████████████████████████ 67
   src/cli/parser.py                          ████████████████░░░░░░░░░ 42
   tests/test_engine.py                       ██████████░░░░░░░░░░░░░░░ 28
   ...
 
-  🔀 Branch Overview
+  Branch Overview
   Local branches sorted by recent activity
   * main                  today
     feat/auth-middleware  3d ago     (+12 ahead)
     fix/timeout-bug       1w ago     (+2 ahead)
     hotfix/crash          5mo ago    (diverged)
 
-  🚀 Weekly Velocity (recent 12 weeks)
+  Weekly Velocity (recent 12 weeks)
   2026-W18  █████████████████████████ 23
   2026-W19  █████████████████████░░░ 19
   ...
 
   ────────────────────────────────────────────────────────────
-  Generated by commit-velociraptor v1.2.0 🦖
+  Generated by commit-velociraptor v1.3.0
 ```
 
 ---
 
-## 🛠️ Development
+## Development
 
 ```bash
 # Clone
@@ -201,7 +223,7 @@ python velociraptor.py ~/some-big-project --all-time
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the project
 2. Create your feature branch (`git checkout -b feature/amazing-thing`)
@@ -214,7 +236,7 @@ required to run this tool.
 
 ---
 
-## 📄 License
+## License
 
 MIT License. See [LICENSE](LICENSE) for details.
 
